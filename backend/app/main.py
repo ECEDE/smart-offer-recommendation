@@ -12,6 +12,7 @@ from pathlib import Path
 from uuid import uuid4
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from .oncall_agent import analyze_alert
 
 DB_PATH = os.environ.get("SMART_OFFER_DB", str(Path(__file__).resolve().parents[1] / "smart_offers.db"))
 app = FastAPI(title="Smart Offer Recommendation", version="0.2.0")
@@ -176,4 +177,17 @@ def monitoring_alerts():
             if alert
             else "Recommendation failure rate within threshold"
         )
+    }
+
+
+
+@app.get("/agent/investigate")
+def investigate():
+    """Investigate current recommendation monitoring alerts."""
+    alert_data = monitoring_alerts()
+    analysis = analyze_alert(alert_data)
+
+    return {
+        "monitoring": alert_data,
+        "investigation": analysis,
     }
