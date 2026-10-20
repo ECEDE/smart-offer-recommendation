@@ -2,6 +2,10 @@
 PostgreSQL, React, observability and agent responder are later milestones.
 """
 import os
+import json
+import logging
+import time
+from datetime import datetime, timezone
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -11,6 +15,17 @@ from pydantic import BaseModel
 
 DB_PATH = os.environ.get("SMART_OFFER_DB", str(Path(__file__).resolve().parents[1] / "smart_offers.db"))
 app = FastAPI(title="Smart Offer Recommendation", version="0.2.0")
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+logger = logging.getLogger("smart_offer")
+
+def log_event(event_type, **fields):
+    logger.info(json.dumps({
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "event_type": event_type,
+        **fields
+    }))
+
 
 @contextmanager
 def db():
@@ -62,6 +77,7 @@ def eligible_tariffs(customer, tariffs):
 
 @app.post("/customers/{customer_id}/recommendations")
 def recommend(customer_id: int):
+    start = time.perf_counter()
     with db() as conn:
         c=conn.execute("SELECT * FROM customers WHERE id=?",(customer_id,)).fetchone()
         if c is None: raise HTTPException(404,"Customer not found")
@@ -72,6 +88,14 @@ def recommend(customer_id: int):
         reason=None if status=="success" else f"Only {len(selected)} eligible offers found; 4 required"
         conn.execute("INSERT INTO runs VALUES (?, ?, ?, ?)",(run_id,customer_id,status,reason))
         conn.executemany("INSERT INTO offers VALUES (?, ?, ?)",[(run_id,t["id"],i) for i,t in enumerate(selected,1)])
+        log_event(
+            "recommendation",
+            customer_id=customer_id,
+            run_id=run_id,
+            status=status,
+            offer_count=len(selected),
+            duration_ms=round((time.perf_counter()-start)*1000, 2)
+        )
         return {"run_id":run_id,"status":status,"reason":reason,"offers":[{"rank":i,"tariff_id":t["id"],"name":t["name"],"gb":t["gb"],"price":t["price"],"explanation":"Eligible by GB and price; ranked by ascending GB, price and ID"} for i,t in enumerate(selected,1)]}
 
 class Acceptance(BaseModel):
@@ -85,6 +109,13 @@ def accept(run_id: str, payload: Acceptance):
         if conn.execute("SELECT 1 FROM acceptances WHERE run_id=?",(run_id,)).fetchone(): raise HTTPException(409,"This run already has an acceptance")
         before,after=row["current_price"],row["price"]
         conn.execute("INSERT INTO acceptances VALUES (?, ?, ?, ?)",(run_id,payload.tariff_id,before,after))
+        log_event(
+            "acceptance",
+            run_id=run_id,
+            tariff_id=payload.tariff_id,
+            status="success",
+            uplift=round(after-before, 2)
+        )
         return {"run_id":run_id,"tariff_id":payload.tariff_id,"uplift":round(after-before,2),"uplift_pct":round(100*(after-before)/before,2) if before else None}
 
 @app.get("/dashboard/metrics")
