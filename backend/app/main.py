@@ -186,8 +186,81 @@ def investigate():
     """Investigate current recommendation monitoring alerts."""
     alert_data = monitoring_alerts()
     analysis = analyze_alert(alert_data)
+    failed_runs = investigate_failed_runs()
 
     return {
         "monitoring": alert_data,
         "investigation": analysis,
+        "failed_runs_analysis": failed_runs,
     }
+
+
+
+def investigate_failed_runs(limit: int = 10):
+    """Inspect recent failed recommendations and their eligibility constraints."""
+    with db() as conn:
+        failed_runs = conn.execute(
+            """
+            SELECT r.id, r.customer_id, r.status, r.reason,
+                   c.current_gb, c.current_price, c.usage_gb
+            FROM runs r
+            JOIN customers c ON c.id = r.customer_id
+            WHERE r.status != 'success'
+            ORDER BY r.created_at DESC
+            LIMIT ?
+            """,
+            (limit,)
+        ).fetchall()
+
+        tariffs = [
+            dict(row)
+            for row in conn.execute("SELECT * FROM tariffs")
+        ]
+
+    investigations = []
+
+    for row in failed_runs:
+        customer = dict(row)
+
+        eligible = eligible_tariffs(customer, tariffs)
+
+        active = [t for t in tariffs if t["active"]]
+
+        gb_min = max(0, customer["current_gb"] - 5)
+        gb_max = customer["usage_gb"] + 10
+
+        gb_eligible = [
+            t for t in active
+            if gb_min <= t["gb"] <= gb_max
+        ]
+
+        price_eligible = [
+            t for t in active
+            if t["price"] > customer["current_price"]
+        ]
+
+        investigations.append({
+            "run_id": customer["id"],
+            "customer_id": customer["customer_id"],
+            "status": customer["status"],
+            "reason": customer["reason"],
+            "current_gb": customer["current_gb"],
+            "usage_gb": customer["usage_gb"],
+            "current_price": customer["current_price"],
+            "eligible_offer_count": len(eligible),
+            "resolution_status": (
+                "currently_resolved"
+                if len(eligible) == 4
+                else "still_failing"
+            ),
+            "gb_eligible_tariff_count": len(gb_eligible),
+            "price_eligible_tariff_count": len(price_eligible),
+            "possible_constraints": [
+                name for name, count in [
+                    ("GB eligibility", len(gb_eligible)),
+                    ("Price eligibility", len(price_eligible))
+                ] if count < 4
+            ],
+        })
+
+    return investigations
