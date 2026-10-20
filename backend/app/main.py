@@ -47,6 +47,12 @@ def initialize():
         CREATE TABLE IF NOT EXISTS offers (run_id TEXT NOT NULL, tariff_id INTEGER NOT NULL, rank INTEGER NOT NULL, PRIMARY KEY(run_id, tariff_id));
         CREATE TABLE IF NOT EXISTS acceptances (run_id TEXT PRIMARY KEY, tariff_id INTEGER NOT NULL, before_price REAL NOT NULL, accepted_price REAL NOT NULL);
         """)
+        columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(runs)")
+        }
+        if "created_at" not in columns:
+            conn.execute("ALTER TABLE runs ADD COLUMN created_at TEXT")
         conn.executemany("INSERT OR IGNORE INTO customers VALUES (?, ?, ?, ?)", [(i, float([10,20,30,40][i%4]), float(200+(i%4)*100), float([12,18,24,33][i%4])) for i in range(1,31)])
         conn.executemany("INSERT OR IGNORE INTO tariffs VALUES (?, ?, ?, ?, 1)", [(i,f"Plan {i}",float(5+i*5),float(150+i*45)) for i in range(1,17)])
 
@@ -86,7 +92,10 @@ def recommend(customer_id: int):
         run_id=str(uuid4())
         status="success" if len(selected)==4 else "insufficient_offers"
         reason=None if status=="success" else f"Only {len(selected)} eligible offers found; 4 required"
-        conn.execute("INSERT INTO runs VALUES (?, ?, ?, ?)",(run_id,customer_id,status,reason))
+        conn.execute(
+            "INSERT INTO runs (id, customer_id, status, reason, created_at) VALUES (?, ?, ?, ?, ?)",
+            (run_id, customer_id, status, reason, datetime.now(timezone.utc).isoformat())
+        )
         conn.executemany("INSERT INTO offers VALUES (?, ?, ?)",[(run_id,t["id"],i) for i,t in enumerate(selected,1)])
         log_event(
             "recommendation",
@@ -125,3 +134,46 @@ def metrics():
         accepted=conn.execute("SELECT COUNT(*) FROM acceptances").fetchone()[0]
         failures=conn.execute("SELECT COUNT(*) FROM runs WHERE status!='success'").fetchone()[0]
         return {"recommendation_runs":runs,"acceptances":accepted,"acceptance_rate_pct":round(100*accepted/runs,2) if runs else 0,"insufficient_offer_runs":failures}
+
+
+@app.get("/monitoring/alerts")
+def monitoring_alerts():
+    """Evaluate recommendation failures over the last 15 minutes."""
+    from datetime import timedelta
+
+    window_start = (
+        datetime.now(timezone.utc) - timedelta(minutes=15)
+    ).isoformat()
+
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total_runs,
+                SUM(CASE WHEN status != 'success' THEN 1 ELSE 0 END) AS failed_runs
+            FROM runs
+            WHERE created_at >= ?
+            """,
+            (window_start,)
+        ).fetchone()
+
+    total = row["total_runs"] or 0
+    failed = row["failed_runs"] or 0
+    failure_rate = round(100 * failed / total, 2) if total else 0
+
+    alert = total > 0 and failure_rate > 10
+
+    return {
+        "window_minutes": 15,
+        "total_runs": total,
+        "failed_runs": failed,
+        "failure_rate_pct": failure_rate,
+        "threshold_pct": 10,
+        "alert": alert,
+        "severity": "critical" if alert else "ok",
+        "message": (
+            "High recommendation failure rate detected"
+            if alert
+            else "Recommendation failure rate within threshold"
+        )
+    }
